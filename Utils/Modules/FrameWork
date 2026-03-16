@@ -1,0 +1,162 @@
+--!native
+--!optimize 2
+
+local Promise = require(script.Parent.Promise)
+local EventBus = require(script.Parent.EventBus)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+export type Service = {
+	Name: string,
+	Dependencies: {string}?,
+	Init: ((self: Service) -> ())?,
+	Start: ((self: Service) -> ())?,
+	Events: EventBus.EventBus<any>,
+	ClientCall: {[string]: any}?
+}
+
+export type Framework = {
+	CreateService: (self: Framework, service: Service) -> Service,
+	GetService: (self: Framework, name: string) -> Service,
+	LoadServices: (self: Framework, folder: Instance) -> (),
+	Start: (self: Framework) -> Promise.Promise<() -> ()>,
+	_services: {[string]: Service},
+	_order: {Service},
+	_started: boolean
+}
+
+local Framework = {}
+Framework.__index = Framework
+
+local function ensureRemoteFolder(): Folder
+	local folder = ReplicatedStorage:FindFirstChild("RemoteEvents")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "RemoteEvents"
+		folder.Parent = ReplicatedStorage
+	end
+	return folder
+end
+
+local function createServiceRemote(serviceName: string): RemoteEvent
+	local folder = ensureRemoteFolder()
+	local remote = folder:FindFirstChild(serviceName)
+	if not remote then
+		remote = Instance.new("RemoteEvent")
+		remote.Name = serviceName
+		remote.Parent = folder
+	end
+	return remote
+end
+
+type Internal = Framework
+
+function Framework.new(): Framework
+	local self: Internal = setmetatable({
+		_services = {},
+		_order = table.create(32),
+		_started = false
+	}, Framework)
+	return self
+end
+
+function Framework:CreateService(service: Service): Service
+	local name = service.Name
+	if not name then
+		error("Service missing Name")
+	end
+	local services = self._services
+	if services[name] then
+		error("Service already exists: "..name)
+	end
+	service.Events = EventBus.new()
+	service.ClientCall = service.ClientCall or {}
+	if RunService:IsServer() then
+		local remote = createServiceRemote(name)
+		service._Remote = remote
+		remote.OnServerEvent:Connect(function(player, eventName, ...)
+			service.Events:Emit(eventName, player, ...)
+		end)
+	end
+	if RunService:IsClient() then
+		local folder = ensureRemoteFolder()
+		local remote = folder:WaitForChild(name)
+		service._Remote = remote
+		remote.OnClientEvent:Connect(function(eventName, ...)
+			service.Events:Emit(eventName, ...)
+		end)
+	end
+	services[name] = service
+	return service
+end
+
+function Framework:GetService(name: string): Service
+	local service = self._services[name]
+	if not service then
+		error("Unknown service: "..name)
+	end
+	return service
+end
+
+function Framework:LoadServices(folder: Instance)
+	for _, module in ipairs(folder:GetChildren()) do
+		if module:IsA("ModuleScript") then
+			local service = require(module)
+			if type(service) == "table" and service.Name then
+				self:CreateService(service)
+			end
+		end
+	end
+end
+
+local function resolveOrder(services: {[string]: Service}): {Service}
+	local resolved = table.create(16)
+	local visited = {}
+	local function visit(service: Service)
+		if visited[service] then return end
+		visited[service] = true
+		local deps = service.Dependencies
+		if deps then
+			for i = 1, #deps do
+				local dep = services[deps[i]]
+				if not dep then
+					error("Missing dependency "..deps[i].." for "..service.Name)
+				end
+				visit(dep)
+			end
+		end
+		resolved[#resolved+1] = service
+	end
+	for _, service in pairs(services) do
+		visit(service)
+	end
+	return resolved
+end
+
+function Framework:Start(): Promise.Promise<() -> ()>
+	if self._started then
+		error("Framework already started")
+	end
+	self._started = true
+
+	local order = resolveOrder(self._services)
+	self._order = order
+
+	return Promise.new(function(resolve)
+		for i = 1, #order do
+			local service = order[i]
+			if service.Init then
+				service:Init()
+			end
+		end
+		for i = 1, #order do
+			local service = order[i]
+			if service.Start then
+				service:Start()
+			end
+		end
+		resolve()
+	end)
+end
+
+return Framework
