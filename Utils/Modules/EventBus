@@ -1,0 +1,81 @@
+--!native
+--!optimize 2
+
+local Promise = require(script.Parent.Promise)
+local Signal = require(script.Parent.Signal)
+
+export type EventBus<Arg> = {
+	Emit: (self: EventBus<Arg>, eventName: string, payload: Arg) -> (),
+	On: (self: EventBus<Arg>, eventName: string, fn:(Arg)->()) -> any,
+	Once: (self: EventBus<Arg>, eventName: string, fn:(Arg)->()) -> any,
+	Wait: (self: EventBus<Arg>, eventName: string) -> Promise.Promise<Arg>,
+	Clear: (self: EventBus<Arg>, eventName: string) -> ()
+}
+
+type EventBusInternal<Arg> = {
+	_events: {[string]: Signal.Signal<Arg>}
+}
+
+local EventBus = {}
+EventBus.__index = EventBus
+
+function EventBus.new<Arg>(): EventBus<Arg>
+	local self: EventBusInternal<Arg> = setmetatable({
+		_events = {}
+	}, EventBus)
+
+	return self :: any
+end
+
+function EventBus:Emit<Arg>(eventName: string, payload: Arg)
+	local sig = self._events[eventName]
+	if sig then
+		sig:Fire(payload)
+	end
+end
+
+function EventBus:On<Arg>(eventName: string, fn:(Arg)->())
+	local events = self._events
+	local sig = events[eventName]
+
+	if not sig then
+		sig = Signal.new()
+		events[eventName] = sig
+	end
+
+	return sig:Connect(fn)
+end
+
+function EventBus:Once<Arg>(eventName: string, fn:(Arg)->())
+	local events = self._events
+	local sig = events[eventName]
+
+	if not sig then
+		sig = Signal.new()
+		events[eventName] = sig
+	end
+
+	return sig:Once(fn)
+end
+
+function EventBus:Wait<Arg>(eventName: string): Promise.Promise<Arg>
+	local events = self._events
+	local sig = events[eventName]
+
+	if not sig then
+		sig = Signal.new()
+		events[eventName] = sig
+	end
+
+	return sig:Wait()
+end
+
+function EventBus:Clear(eventName: string)
+	local sig = self._events[eventName]
+	if sig then
+		sig:DisconnectAll()
+		self._events[eventName] = nil
+	end
+end
+
+return EventBus
